@@ -17,6 +17,8 @@ Rules:
 - Never take irreversible actions (e.g. submit forms that change data) unless the task explicitly asks you to.
 - When you have the answer, call done(answer) with a clear, structured response (e.g. bullets or short paragraphs).
 - CRITICAL: You MUST ALWAYS respond with a tool call. NEVER respond with plain text alone.
+- SEARCH BARS: After typing into any search bar or input field, always press_key("Enter") to submit the search. Then wait for the results page to load and use click() to select the correct result. Do NOT try to click autocomplete dropdown suggestions — press Enter instead.
+- FLIGHT SEARCH FORMS: When filling out a flight search form, follow this order: (1) Set trip type first (e.g. click "Round trip" to open the dropdown, then click "One way"). (2) Set passenger count if needed. (3) Type the departure city/airport in the "From" field, then press Enter or click the first autocomplete result. (4) Type the destination in the "To" field, then press Enter or click the first autocomplete result. (5) Click the date field and select the departure date. (6) Click the Search/Find button. After each click that opens a dropdown or picker, call get_page_state() to see the new options before acting.
 - LOGIN WALLS & CAPTCHAS: If a page requires login, shows a signup form, or shows a CAPTCHA/human verification, call request_human_help(reason="...") immediately. Do NOT attempt to log in yourself. Wait for the human to complete it — they will see the live browser window. After they click Resume, continue the task.
 - For job searches: use Google Search (e.g. open_url("https://www.google.com/search?q=software+engineering+jobs+Austin+TX+%24150k")) — Google shows job listings directly in results without login.
 """

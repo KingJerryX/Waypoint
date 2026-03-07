@@ -10,7 +10,7 @@ from page_state import get_page_state, page_state_to_dict
 # Default timeout for navigation and actions
 NAV_TIMEOUT_MS = 15000
 ACTION_TIMEOUT_MS = 10000
-DEFAULT_WAIT_AFTER_LOAD_MS = 1500
+DEFAULT_WAIT_AFTER_LOAD_MS = 700
 
 # Screenshots saved here on failure or on done
 SCREENSHOT_DIR = Path(__file__).resolve().parent / "logs"
@@ -56,12 +56,25 @@ class BrowserController:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._pw:
-            await self._pw.stop()
+        # Close in order, swallowing errors so cleanup always completes
+        for coro, obj in [
+            (lambda o: o.close(), self._context),
+            (lambda o: o.close(), self._browser),
+            (lambda o: o.stop(),  self._pw),
+        ]:
+            if obj is not None:
+                try:
+                    await coro(obj)
+                except Exception:
+                    pass
+        # Force-kill the browser process if it's still alive (prevents zombie chrome.exe)
+        try:
+            if self._browser is not None:
+                proc = getattr(self._browser, "process", None)
+                if proc is not None and proc.returncode is None:
+                    proc.kill()
+        except Exception:
+            pass
 
     @property
     def page(self) -> Page:
@@ -74,8 +87,11 @@ class BrowserController:
     async def open_url(self, url: str) -> dict[str, Any]:
         """Open a URL and wait for load. Returns page state summary or error."""
         try:
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            await asyncio.sleep(DEFAULT_WAIT_AFTER_LOAD_MS / 1000.0)
+            is_blank = url in ("about:blank", "", None)
+            wait_until = "commit" if is_blank else "domcontentloaded"
+            await self.page.goto(url, wait_until=wait_until, timeout=NAV_TIMEOUT_MS)
+            if not is_blank:
+                await asyncio.sleep(DEFAULT_WAIT_AFTER_LOAD_MS / 1000.0)
             state = await get_page_state(self.page)
             return {"ok": True, "state": page_state_to_dict(state)}
         except Exception as e:
@@ -91,24 +107,40 @@ class BrowserController:
 
     async def click(self, text_or_selector: str) -> dict[str, Any]:
         """Click element by visible text or selector. Prefer text match for buttons/links."""
-        try:
-            # Try as selector first (e.g. "#submit")
+        _is_css = text_or_selector.startswith(("#", ".", "[", "/")) or " > " in text_or_selector
+
+        # (strategy, timeout_ms)
+        strategies: list[tuple] = []
+
+        if _is_css:
+            # Looks like a real selector — try it directly first
+            strategies.append((lambda: self.page.locator(text_or_selector).first, 3000))
+
+        # ARIA role matches (fast-fail when role doesn't exist)
+        t = text_or_selector
+        strategies += [
+            (lambda: self.page.get_by_role("tab",      name=t).first,     1500),
+            (lambda: self.page.get_by_role("link",     name=t).first,     1500),
+            (lambda: self.page.get_by_role("button",   name=t).first,     1500),
+            (lambda: self.page.get_by_role("menuitem", name=t).first,     1500),
+            # Visible interactive elements including dropdown list items
+            (lambda: self.page.locator(
+                "a, button, [role='tab'], [role='link'], [role='menuitem'], [role='option'], "
+                "li, [role='listitem'], [role='radio'], label, [role='treeitem']"
+            ).filter(has_text=t).first,                                    3000),
+        ]
+
+        last_err = ""
+        for make_locator, timeout in strategies:
             try:
-                await self.page.click(text_or_selector, timeout=3000)
-            except Exception:
-                # Fallback: click by text (button or link containing this text)
-                await self.page.get_by_role("button", name=text_or_selector).first.click(timeout=3000)
-            await asyncio.sleep(0.5)
-            state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
-        except Exception as e1:
-            try:
-                await self.page.locator(f"text={text_or_selector}").first.click(timeout=3000)
-                await asyncio.sleep(0.5)
+                await make_locator().click(timeout=timeout)
+                await asyncio.sleep(0.3)
                 state = await get_page_state(self.page)
                 return {"ok": True, "state": page_state_to_dict(state)}
-            except Exception as e2:
-                return {"ok": False, "error": f"click failed: {e1}; fallback: {e2}"}
+            except Exception as e:
+                last_err = str(e)
+                continue
+        return {"ok": False, "error": f"click failed after all strategies: {last_err}"}
 
     async def type_text(self, selector: str, value: str) -> dict[str, Any]:
         """Type into an input using keyboard events (triggers autocomplete in SPAs)."""
@@ -139,8 +171,15 @@ class BrowserController:
                 return {"ok": False, "error": f"Could not find input: '{selector}'. Try get_page_state to see available inputs, then use the exact placeholder or label text."}
 
             # Type character-by-character to fire events (triggers autocomplete etc.)
-            await self.page.keyboard.type(value, delay=60)
-            await asyncio.sleep(1.2)  # Wait for autocomplete to appear
+            await self.page.keyboard.type(value, delay=40)
+            await asyncio.sleep(0.3)
+
+            # Auto-submit search inputs so the agent never has to guess
+            _is_search = any(kw in selector.lower() for kw in ("search", "query", "q", "find", "keyword"))
+            if _is_search:
+                await self.page.keyboard.press("Enter")
+                await asyncio.sleep(1.2)  # wait for results page to load
+
             state = await get_page_state(self.page)
             return {"ok": True, "state": page_state_to_dict(state)}
         except Exception as e:
@@ -150,7 +189,9 @@ class BrowserController:
         """Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown, ArrowUp)."""
         try:
             await self.page.keyboard.press(key)
-            await asyncio.sleep(0.6)
+            # Enter/Return may trigger navigation — wait longer for page to settle
+            wait = 1.2 if key in ("Enter", "Return") else 0.3
+            await asyncio.sleep(wait)
             state = await get_page_state(self.page)
             return {"ok": True, "state": page_state_to_dict(state)}
         except Exception as e:
@@ -175,6 +216,14 @@ class BrowserController:
             return {"ok": True, "path": str(path)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    async def wait_for_settled(self, timeout_ms: int = 5000) -> None:
+        """Wait for the page to finish navigating/loading after human interaction."""
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
 
     async def screenshot_b64(self) -> str:
         """Take a screenshot and return as base64-encoded PNG string."""

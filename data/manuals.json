@@ -70,5 +70,29 @@
     "task": "Go to Hacker News and summarize the top 5 stories",
     "max_steps": 15,
     "no_click": false
+  },
+  "e56df549": {
+    "id": "e56df549",
+    "title": "Go to Hacker News and summarize the top 5 stories",
+    "url": "",
+    "task": "Go to Hacker News and summarize the top 5 stories",
+    "max_steps": 15,
+    "no_click": false
+  },
+  "d358b18e": {
+    "id": "d358b18e",
+    "title": "Go to Hacker News and summarize the top 5 stories",
+    "url": "",
+    "task": "Go to Hacker News and summarize the top 5 stories",
+    "max_steps": 9,
+    "no_click": false
+  },
+  "f8c7f15c": {
+    "id": "f8c7f15c",
+    "title": "Go to Hacker News and summarize the top 5 stories",
+    "url": "",
+    "task": "Go to Hacker News and summarize the top 5 stories",
+    "max_steps": 14,
+    "no_click": false
   }
 }
