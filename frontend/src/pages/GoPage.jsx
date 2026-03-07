@@ -131,7 +131,7 @@ export default function GoPage() {
   if (loadError) return (
     <div className="app-shell">
       <nav className="navbar">
-        <a href="/" className="navbar-brand">Orbit <span className="navbar-badge">BETA</span></a>
+        <a href="/" className="navbar-brand">Waypoint <span className="navbar-badge">BETA</span></a>
       </nav>
       <div className="page">
         <div className="card">
@@ -147,7 +147,7 @@ export default function GoPage() {
   if (!manual) return (
     <div className="app-shell">
       <nav className="navbar">
-        <a href="/" className="navbar-brand">Orbit <span className="navbar-badge">BETA</span></a>
+        <a href="/" className="navbar-brand">Waypoint <span className="navbar-badge">BETA</span></a>
       </nav>
       <div className="page">
         <div className="card">
@@ -160,7 +160,7 @@ export default function GoPage() {
   return (
     <div className="app-shell">
       <nav className="navbar">
-        <a href="/" className="navbar-brand">Orbit <span className="navbar-badge">BETA</span></a>
+        <a href="/" className="navbar-brand">Waypoint <span className="navbar-badge">BETA</span></a>
         {status && <StatusPill status={status} />}
       </nav>
 
