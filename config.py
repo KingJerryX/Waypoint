@@ -10,6 +10,9 @@ DEFAULT_ALLOWED_TOOLS = [
     "scroll_down",
     "type",
     "press_key",
+    "submit_search",
+    "sort_by_view_count",
+    "open_top_result",
     "request_human_help",
     "done",
 ]

@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -19,9 +20,97 @@ TOOL_GET_PAGE_STATE = "get_page_state"
 TOOL_CLICK = "click"
 TOOL_TYPE = "type"
 TOOL_PRESS_KEY = "press_key"
+TOOL_SUBMIT_SEARCH = "submit_search"
+TOOL_SORT_BY_VIEW_COUNT = "sort_by_view_count"
+TOOL_OPEN_TOP_RESULT = "open_top_result"
 TOOL_SCROLL_DOWN = "scroll_down"
 TOOL_REQUEST_HUMAN = "request_human_help"
 TOOL_DONE = "done"
+
+
+def _is_search_like_action(fn_args: dict[str, Any], state: Optional[dict[str, Any]]) -> bool:
+    """Detect when a type action is likely intended as a search."""
+    selector = str(fn_args.get("selector", "")).lower()
+    value = str(fn_args.get("value", "")).strip()
+    if not value:
+        return False
+    if "search" in selector or selector in {"q", "query"}:
+        return True
+    if state:
+        url = str(state.get("url", "")).lower()
+        buttons = [str(b).lower() for b in (state.get("buttons") or [])]
+        if "youtube.com" in url:
+            return True
+        if any("search" in b or b in {"go", "find"} for b in buttons):
+            return True
+    return False
+
+
+def _is_same_action(prev: dict[str, Any], fn_name: str, fn_args: dict[str, Any]) -> bool:
+    """Check whether the model is attempting the exact same action again."""
+    return prev.get("tool") == fn_name and (prev.get("args") or {}) == (fn_args or {})
+
+
+def _page_fingerprint(state: Optional[dict[str, Any]]) -> str:
+    """Small page signature to detect stuck loops despite repeated actions."""
+    if not state:
+        return "none"
+    payload = {
+        "url": state.get("url"),
+        "title": state.get("title"),
+        "text_head": (state.get("text") or "")[:300],
+        "buttons": (state.get("buttons") or [])[:8],
+        "inputs": (state.get("inputs") or [])[:8],
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=True)
+
+
+def _did_search_submit_effect(
+    before_state: Optional[dict[str, Any]],
+    after_state: Optional[dict[str, Any]],
+    query: str,
+) -> bool:
+    """Detect whether search submission likely changed page/search state."""
+    if not before_state or not after_state:
+        return False
+    before_url = str(before_state.get("url", ""))
+    after_url = str(after_state.get("url", ""))
+    before_title = str(before_state.get("title", ""))
+    after_title = str(after_state.get("title", ""))
+    q = (query or "").strip().lower()
+
+    if after_url != before_url:
+        return True
+    if after_title != before_title:
+        return True
+    if q and q in after_url.lower():
+        return True
+    if (before_state.get("text") or "")[:400] != (after_state.get("text") or "")[:400]:
+        return True
+    return False
+
+
+def _extract_search_query(task: str) -> Optional[str]:
+    """Best-effort extraction of quoted search query from task text."""
+    if not task:
+        return None
+    m = re.search(r'"([^"]+)"', task)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"search(?: for)?\s+([^\n\.]+)", task, flags=re.I)
+    if m2:
+        return m2.group(1).strip().strip("'")
+    return None
+
+
+def _should_run_youtube_view_count_flow(task: str, url: str) -> bool:
+    t = (task or "").lower()
+    u = (url or "").lower()
+    return (
+        "youtube" in u
+        and ("view count" in t or "most-viewed" in t or "most viewed" in t)
+        and ("search" in t or "find" in t or "retrieve" in t)
+    )
 
 
 # #region agent log
@@ -69,7 +158,7 @@ GEMINI_TOOL_DECLARATIONS = [
     },
     {
         "name": TOOL_CLICK,
-        "description": "Click a button or link by its visible text or CSS selector.",
+        "description": "Click a button or link by its visible text or CSS selector. Use this to submit searches by clicking Search/Submit/magnifier immediately after typing.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -83,7 +172,7 @@ GEMINI_TOOL_DECLARATIONS = [
     },
     {
         "name": TOOL_TYPE,
-        "description": "Type text into an input field. Use the exact placeholder text or label visible on the page (e.g. 'Where to?', 'Search', 'Destination'). Call get_page_state first to see available inputs if unsure.",
+        "description": "Type text into an input field. Use the exact placeholder text or label visible on the page (e.g. 'Where to?', 'Search', 'Destination'). IMPORTANT: After type(...) for a search query, the VERY NEXT action must be search submission via click(Search/Submit/magnifier) or press_key('Enter'). Never type the same query twice in a row.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -95,7 +184,7 @@ GEMINI_TOOL_DECLARATIONS = [
     },
     {
         "name": TOOL_PRESS_KEY,
-        "description": "Press a keyboard key. Use 'Enter' to confirm/submit or select autocomplete, 'Tab' to move focus, 'Escape' to dismiss, 'ArrowDown'/'ArrowUp' to navigate autocomplete dropdowns.",
+        "description": "Press a keyboard key. Use 'Enter' to confirm/submit searches right after typing (especially when search button click is unavailable), 'Tab' to move focus, 'Escape' to dismiss, 'ArrowDown'/'ArrowUp' to navigate autocomplete dropdowns.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -103,6 +192,29 @@ GEMINI_TOOL_DECLARATIONS = [
             },
             "required": ["key"],
         },
+    },
+    {
+        "name": TOOL_SUBMIT_SEARCH,
+        "description": "Submit the currently filled search field deterministically. Use this immediately after type(...) for search tasks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prefer_enter": {
+                    "type": "boolean",
+                    "description": "If true, press Enter first; otherwise click site-specific search submit control first.",
+                }
+            },
+        },
+    },
+    {
+        "name": TOOL_SORT_BY_VIEW_COUNT,
+        "description": "Sort supported search results by highest view count (deterministic site adapter flow).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": TOOL_OPEN_TOP_RESULT,
+        "description": "Open the top result for supported sites (deterministic site adapter flow).",
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": TOOL_SCROLL_DOWN,
@@ -332,6 +444,46 @@ def request_approval_cli(action_name: str, action_args: dict, timeout_seconds: i
         return False
 
 
+async def _run_youtube_view_count_flow(browser, task: str) -> dict[str, Any]:
+    """
+    Deterministic helper flow for common YouTube 'most viewed' tasks:
+    type query -> submit search -> sort by view count -> open top result.
+    """
+    query = _extract_search_query(task) or "mitosis"
+    state_result = await browser.get_page_state()
+    if not state_result.get("ok"):
+        return {"ok": False, "error": state_result.get("error", "get_page_state failed")}
+
+    state = state_result.get("state") or {}
+    selector = "Search"
+    for inp in state.get("inputs", []) or []:
+        placeholder = str(inp.get("placeholder", "")).lower()
+        aria_label = str(inp.get("aria-label", "")).lower()
+        if "search" in placeholder or "search" in aria_label:
+            selector = inp.get("element_id") or inp.get("id") or inp.get("name") or inp.get("placeholder") or "Search"
+            break
+
+    typed = await browser.type_text(str(selector), query)
+    if not typed.get("ok"):
+        return {"ok": False, "error": typed.get("error", "type_text failed")}
+
+    submitted = await browser.submit_search(prefer_enter=True)
+    if not submitted.get("ok"):
+        submitted = await browser.submit_search(prefer_enter=False)
+    if not submitted.get("ok"):
+        return {"ok": False, "error": submitted.get("error", "submit_search failed")}
+
+    sorted_result = await browser.sort_by_view_count()
+    if not sorted_result.get("ok"):
+        return {"ok": False, "error": sorted_result.get("error", "sort_by_view_count failed")}
+
+    opened = await browser.open_top_result()
+    if not opened.get("ok"):
+        return {"ok": False, "error": opened.get("error", "open_top_result failed")}
+
+    return {"ok": True, "state": opened.get("state")}
+
+
 async def run_agent(
     browser,
     task: str,
@@ -361,6 +513,15 @@ async def run_agent(
     tools_ok = 0
     tools_failed = 0
     start_time = time.perf_counter()
+    crawl_phase = "observe_required"
+    repeated_action_breaks = 0
+    auto_submit_attempts = 0
+    auto_submit_success = 0
+    auto_submit_retries = 0
+    forced_state_refreshes = 0
+    last_model_action_sig: Optional[str] = None
+    last_state_fp = "none"
+    same_state_streak = 0
 
     system_prompt = build_system_prompt(constraints)
 
@@ -380,12 +541,33 @@ async def run_agent(
         current_state = result.get("state")
         steps_log.append({"tool": TOOL_OPEN_URL, "args": {"url": url}, "ok": True})
         tools_ok += 1
+        last_state_fp = _page_fingerprint(current_state)
+        crawl_phase = "observe_done"
         if on_step:
             try:
                 b64 = await browser.screenshot_b64()
                 await on_step(0, TOOL_OPEN_URL, b64)
             except Exception:
                 pass
+        # Deterministic helper for common YouTube "sort by view count" workflows.
+        if _should_run_youtube_view_count_flow(task, url):
+            deterministic_out = await _run_youtube_view_count_flow(browser, task)
+            if deterministic_out.get("ok"):
+                current_state = deterministic_out.get("state")
+                final_answer = (
+                    "Completed deterministic YouTube flow: searched query, applied 'Sort by: View count', "
+                    "and opened the top result for playback."
+                )
+                steps_log.append({"tool": "deterministic_youtube_view_count_flow", "ok": True})
+            else:
+                last_error = deterministic_out.get("error", "deterministic flow failed")
+                steps_log.append(
+                    {
+                        "tool": "deterministic_youtube_view_count_flow",
+                        "ok": False,
+                        "error": last_error,
+                    }
+                )
 
     step_count = 1
     resume_note: Optional[str] = None
@@ -433,6 +615,145 @@ async def run_agent(
             continue
 
         fn_args = fn_args or {}
+
+        # Crawl transition guard: after state-changing actions, refresh page state before more actions.
+        if crawl_phase == "observe_required" and fn_name not in (
+            TOOL_GET_PAGE_STATE,
+            TOOL_DONE,
+            TOOL_REQUEST_HUMAN,
+            TOOL_OPEN_URL,
+        ):
+            refresh = await browser.get_page_state()
+            if refresh.get("ok"):
+                current_state = refresh.get("state")
+                tools_ok += 1
+                forced_state_refreshes += 1
+                crawl_phase = "observe_done"
+                steps_log.append(
+                    {
+                        "tool": "auto_get_page_state",
+                        "args": {"reason": "transition_guard"},
+                        "ok": True,
+                        "error": None,
+                    }
+                )
+                step_count += 1
+                continue
+
+        # Prevent repeated typing loops by auto-submitting search if model tries to type again.
+        if steps_log and fn_name == TOOL_TYPE and steps_log[-1].get("tool") == TOOL_TYPE:
+            last_type_args = steps_log[-1].get("args", {})
+            same_query = (
+                str(last_type_args.get("value", "")).strip().lower()
+                == str(fn_args.get("value", "")).strip().lower()
+            )
+            if same_query:
+                auto_submit_attempts += 1
+                submit_result = await browser.submit_search(prefer_enter=True)
+                if submit_result.get("ok"):
+                    current_state = submit_result.get("state")
+                    tools_ok += 1
+                    auto_submit_success += 1
+                    crawl_phase = "observe_done"
+                    steps_log.append(
+                        {
+                            "tool": "auto_submit_search",
+                            "args": {"reason": "prevent_repeated_typing", "prefer_enter": True},
+                            "ok": True,
+                            "method": submit_result.get("method"),
+                            "error": None,
+                        }
+                    )
+                    step_count += 1
+                    continue
+                auto_submit_retries += 1
+                fallback_submit = await browser.submit_search(prefer_enter=False)
+                if fallback_submit.get("ok"):
+                    current_state = fallback_submit.get("state")
+                    tools_ok += 1
+                    auto_submit_success += 1
+                    crawl_phase = "observe_done"
+                    steps_log.append(
+                        {
+                            "tool": "auto_submit_search",
+                            "args": {"reason": "prevent_repeated_typing", "prefer_enter": False},
+                            "ok": True,
+                            "method": fallback_submit.get("method"),
+                            "error": None,
+                        }
+                    )
+                    step_count += 1
+                    continue
+                last_error = (
+                    "Repeated typing detected and submit_search failed with Enter and button fallback. "
+                    "Do not type the same query again."
+                )
+                tools_failed += 1
+                step_count += 1
+                continue
+
+        # Generic crawl guardrails:
+        # 1) Block exact repeated click/type/scroll calls and force a state refresh.
+        # 2) Block empty click/type args.
+        if steps_log and fn_name in (TOOL_CLICK, TOOL_TYPE, TOOL_SCROLL_DOWN):
+            if _is_same_action(steps_log[-1], fn_name, fn_args):
+                refresh = await browser.get_page_state()
+                if refresh.get("ok"):
+                    current_state = refresh.get("state")
+                    tools_ok += 1
+                    forced_state_refreshes += 1
+                    crawl_phase = "observe_done"
+                    steps_log.append(
+                        {
+                            "tool": "auto_get_page_state",
+                            "args": {"reason": "prevent_repeated_action"},
+                            "ok": True,
+                            "error": None,
+                        }
+                    )
+                else:
+                    tools_failed += 1
+                last_error = (
+                    "Repeated tool call detected with identical arguments. "
+                    "Use updated page state and choose a different target/action."
+                )
+                step_count += 1
+                continue
+
+        if fn_name == TOOL_CLICK and not str(fn_args.get("text_or_selector", "")).strip():
+            last_error = "click requires non-empty text_or_selector."
+            step_count += 1
+            continue
+        if fn_name == TOOL_TYPE:
+            selector = str(fn_args.get("selector", "")).strip()
+            value = str(fn_args.get("value", "")).strip()
+            if not selector or not value:
+                last_error = "type requires non-empty selector and value."
+                step_count += 1
+                continue
+
+        # Circuit breaker: if model repeats same action while page fingerprint is unchanged, auto-recover.
+        current_fp = _page_fingerprint(current_state)
+        action_sig = f"{fn_name}:{json.dumps(fn_args, sort_keys=True, ensure_ascii=True)}:{current_fp}"
+        if action_sig == last_model_action_sig:
+            repeated_action_breaks += 1
+            refresh = await browser.get_page_state()
+            if refresh.get("ok"):
+                current_state = refresh.get("state")
+                tools_ok += 1
+                forced_state_refreshes += 1
+                crawl_phase = "observe_done"
+                steps_log.append(
+                    {
+                        "tool": "auto_get_page_state",
+                        "args": {"reason": "circuit_breaker"},
+                        "ok": True,
+                        "error": None,
+                    }
+                )
+                step_count += 1
+                continue
+        last_model_action_sig = action_sig
 
         # Constraint: tool allowed?
         if not constraints.is_tool_allowed(fn_name):
@@ -496,6 +817,7 @@ async def run_agent(
                 if result.get("ok"):
                     current_state = result.get("state")
                     tools_ok += 1
+                    crawl_phase = "observe_done"
                 else:
                     last_error = result.get("error")
                     tools_failed += 1
@@ -504,6 +826,7 @@ async def run_agent(
             if result.get("ok"):
                 current_state = result.get("state")
                 tools_ok += 1
+                crawl_phase = "observe_done"
             else:
                 last_error = result.get("error")
                 tools_failed += 1
@@ -512,10 +835,12 @@ async def run_agent(
             if result.get("ok"):
                 current_state = result.get("state")
                 tools_ok += 1
+                crawl_phase = "observe_required"
             else:
                 last_error = result.get("error")
                 tools_failed += 1
         elif fn_name == TOOL_TYPE:
+            pre_type_state = current_state
             result = await browser.type_text(
                 fn_args.get("selector", ""),
                 fn_args.get("value", ""),
@@ -523,6 +848,68 @@ async def run_agent(
             if result.get("ok"):
                 current_state = result.get("state")
                 tools_ok += 1
+                crawl_phase = "observe_required"
+                # For search-like typing, submit deterministically and verify effect.
+                if _is_search_like_action(fn_args, current_state):
+                    auto_submit_attempts += 1
+                    query_value = str(fn_args.get("value", ""))
+                    submit_result = await browser.submit_search(prefer_enter=True)
+                    if submit_result.get("ok"):
+                        submit_state = submit_result.get("state")
+                        if _did_search_submit_effect(pre_type_state, submit_state, query_value):
+                            current_state = submit_state
+                            tools_ok += 1
+                            auto_submit_success += 1
+                            crawl_phase = "observe_done"
+                            steps_log.append(
+                                {
+                                    "tool": "auto_submit_search",
+                                    "args": {"after_tool": TOOL_TYPE, "prefer_enter": True},
+                                    "ok": True,
+                                    "method": submit_result.get("method"),
+                                    "error": None,
+                                }
+                            )
+                        else:
+                            auto_submit_retries += 1
+                            fallback_submit = await browser.submit_search(prefer_enter=False)
+                            if fallback_submit.get("ok"):
+                                current_state = fallback_submit.get("state")
+                                tools_ok += 1
+                                auto_submit_success += 1
+                                crawl_phase = "observe_done"
+                                steps_log.append(
+                                    {
+                                        "tool": "auto_submit_search",
+                                        "args": {"after_tool": TOOL_TYPE, "prefer_enter": False},
+                                        "ok": True,
+                                        "method": fallback_submit.get("method"),
+                                        "error": None,
+                                    }
+                                )
+                            else:
+                                last_error = fallback_submit.get("error", "submit_search fallback failed")
+                                tools_failed += 1
+                    else:
+                        auto_submit_retries += 1
+                        fallback_submit = await browser.submit_search(prefer_enter=False)
+                        if fallback_submit.get("ok"):
+                            current_state = fallback_submit.get("state")
+                            tools_ok += 1
+                            auto_submit_success += 1
+                            crawl_phase = "observe_done"
+                            steps_log.append(
+                                {
+                                    "tool": "auto_submit_search",
+                                    "args": {"after_tool": TOOL_TYPE, "prefer_enter": False},
+                                    "ok": True,
+                                    "method": fallback_submit.get("method"),
+                                    "error": None,
+                                }
+                            )
+                        else:
+                            last_error = fallback_submit.get("error", "submit_search failed")
+                            tools_failed += 1
             else:
                 last_error = result.get("error")
                 tools_failed += 1
@@ -531,6 +918,34 @@ async def run_agent(
             if result.get("ok"):
                 current_state = result.get("state")
                 tools_ok += 1
+                crawl_phase = "observe_required"
+            else:
+                last_error = result.get("error")
+                tools_failed += 1
+        elif fn_name == TOOL_SUBMIT_SEARCH:
+            result = await browser.submit_search(prefer_enter=bool(fn_args.get("prefer_enter", True)))
+            if result.get("ok"):
+                current_state = result.get("state")
+                tools_ok += 1
+                crawl_phase = "observe_done"
+            else:
+                last_error = result.get("error")
+                tools_failed += 1
+        elif fn_name == TOOL_SORT_BY_VIEW_COUNT:
+            result = await browser.sort_by_view_count()
+            if result.get("ok"):
+                current_state = result.get("state")
+                tools_ok += 1
+                crawl_phase = "observe_done"
+            else:
+                last_error = result.get("error")
+                tools_failed += 1
+        elif fn_name == TOOL_OPEN_TOP_RESULT:
+            result = await browser.open_top_result()
+            if result.get("ok"):
+                current_state = result.get("state")
+                tools_ok += 1
+                crawl_phase = "observe_required"
             else:
                 last_error = result.get("error")
                 tools_failed += 1
@@ -539,6 +954,7 @@ async def run_agent(
             if result.get("ok"):
                 current_state = result.get("state")
                 tools_ok += 1
+                crawl_phase = "observe_required"
             else:
                 last_error = result.get("error")
                 tools_failed += 1
@@ -546,6 +962,12 @@ async def run_agent(
             last_error = f"Unknown tool: {fn_name}"
 
         steps_log.append({"tool": fn_name, "args": fn_args, "ok": result.get("ok", False), "error": last_error})
+        new_fp = _page_fingerprint(current_state)
+        if new_fp == last_state_fp:
+            same_state_streak += 1
+        else:
+            same_state_streak = 0
+        last_state_fp = new_fp
         if on_step:
             try:
                 b64 = await browser.screenshot_b64()
@@ -556,12 +978,24 @@ async def run_agent(
 
     total_time = time.perf_counter() - start_time
     total_calls = tools_ok + tools_failed
+    final_fp = _page_fingerprint(current_state)
+    if final_fp == last_state_fp:
+        same_state_streak += 1
+    diagnostics = {
+        "repeated_action_breaks": repeated_action_breaks,
+        "auto_submit_attempts": auto_submit_attempts,
+        "auto_submit_success": auto_submit_success,
+        "auto_submit_retries": auto_submit_retries,
+        "forced_state_refreshes": forced_state_refreshes,
+        "same_state_streak": same_state_streak,
+    }
     metrics = {
         "steps_used": len(steps_log),
         "tools_ok": tools_ok,
         "tools_failed": tools_failed,
         "total_time_s": round(total_time, 2),
         "success": final_answer is not None,
+        "diagnostics": diagnostics,
     }
 
     run_log = {

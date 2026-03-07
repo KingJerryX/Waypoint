@@ -115,6 +115,16 @@ python eval.py --dataset eval_dataset.json --output eval_report.json
 
 This writes `eval_report.json` and `eval_report.md` with per-run metrics and a small table.
 
+### Crawl reliability benchmark
+
+Run the benchmark suite to track crawl workflow quality (loop breaks, forced refreshes, auto-submit success):
+
+```bash
+python benchmark_agent.py --dataset eval_dataset.json --output benchmark_report.json
+```
+
+This writes `benchmark_report.json` and `benchmark_report.md`.
+
 ## What you need to do (can’t be fully automated)
 
 | Step | What to do |
@@ -136,7 +146,9 @@ orbit/
 ├── config.py         # UserConstraints
 ├── manuals.py        # Server-side manual storage (shareable links)
 ├── eval.py           # Batch eval script
+├── benchmark_agent.py # Crawl reliability benchmark script
 ├── eval_dataset.json
+├── site_adapters.py  # Deterministic site-specific helper flows
 ├── requirements.txt
 ├── frontend/        # React (Vite) app: create manual, My Agents, run-by-link page
 ├── static/          # Legacy static HTML (used if frontend/dist not built)

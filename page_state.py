@@ -4,6 +4,7 @@ from typing import Any
 
 # Max chars to send for visible text to keep prompts small
 TEXT_PREVIEW_MAX = 8000
+ELEMENTS_PREVIEW_MAX = 120
 
 
 @dataclass
@@ -14,6 +15,7 @@ class PageState:
     buttons: list[str]
     links: list[str]
     inputs: list[dict[str, Any]]
+    elements: list[dict[str, Any]]
 
 
 async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageState:
@@ -34,6 +36,15 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
     if len((text or "").strip()) > text_max:
         text = text + "\n...[truncated]"
 
+    # Elements index (stable IDs for reliable targeting in prompts/tools)
+    elements: list[dict[str, Any]] = []
+    element_counter = 0
+
+    def next_element_id() -> str:
+        nonlocal element_counter
+        element_counter += 1
+        return f"e{element_counter}"
+
     # Buttons: text of visible buttons
     buttons: list[str] = []
     try:
@@ -41,6 +52,21 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
             t = (await el.inner_text()).strip() or (await el.get_attribute("value") or "").strip()
             if t and t not in buttons:
                 buttons.append(t[:80])
+            if len(elements) < ELEMENTS_PREVIEW_MAX:
+                el_id = (await el.get_attribute("id") or "").strip()[:60]
+                aria = (await el.get_attribute("aria-label") or "").strip()[:80]
+                name = (await el.get_attribute("name") or "").strip()[:60]
+                selector = f"#{el_id}" if el_id else None
+                elements.append(
+                    {
+                        "id": next_element_id(),
+                        "kind": "button",
+                        "text": t[:80] if t else None,
+                        "aria_label": aria or None,
+                        "name": name or None,
+                        "selector": selector,
+                    }
+                )
     except Exception:
         pass
 
@@ -56,6 +82,18 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
                 links.append(f"{t} ({h[:50]})")
             else:
                 links.append(h[:60])
+            if len(elements) < ELEMENTS_PREVIEW_MAX:
+                el_id = (await el.get_attribute("id") or "").strip()[:60]
+                selector = f"#{el_id}" if el_id else None
+                elements.append(
+                    {
+                        "id": next_element_id(),
+                        "kind": "link",
+                        "text": t or None,
+                        "href": h[:200],
+                        "selector": selector,
+                    }
+                )
             if len(links) >= 30:
                 break
     except Exception:
@@ -70,6 +108,7 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
             name = (await el.get_attribute("name") or "").strip()[:40]
             aria_label = (await el.get_attribute("aria-label") or "").strip()[:60]
             el_id = (await el.get_attribute("id") or "").strip()[:40]
+            autocomplete = (await el.get_attribute("autocomplete") or "").strip()[:40]
             entry: dict[str, Any] = {"type": typ}
             if placeholder:
                 entry["placeholder"] = placeholder
@@ -79,7 +118,25 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
                 entry["name"] = name
             if el_id:
                 entry["id"] = el_id
+            element_id = next_element_id()
+            entry["element_id"] = element_id
             inputs.append(entry)
+            if len(elements) < ELEMENTS_PREVIEW_MAX:
+                selector = (
+                    f"#{el_id}" if el_id else (f"[name='{name}']" if name else None)
+                )
+                elements.append(
+                    {
+                        "id": element_id,
+                        "kind": "input",
+                        "type": typ,
+                        "placeholder": placeholder or None,
+                        "aria_label": aria_label or None,
+                        "name": name or None,
+                        "autocomplete": autocomplete or None,
+                        "selector": selector,
+                    }
+                )
     except Exception:
         pass
 
@@ -90,6 +147,7 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
         buttons=buttons,
         links=links,
         inputs=inputs,
+        elements=elements,
     )
 
 
@@ -102,4 +160,5 @@ def page_state_to_dict(state: PageState) -> dict[str, Any]:
         "buttons": state.buttons,
         "links": state.links[:20],
         "inputs": state.inputs,
+        "elements": state.elements[:80],
     }

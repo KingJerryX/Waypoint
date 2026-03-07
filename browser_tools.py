@@ -6,6 +6,7 @@ from typing import Any, Optional
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from page_state import get_page_state, page_state_to_dict
+from site_adapters import get_site_adapter
 
 # Default timeout for navigation and actions
 NAV_TIMEOUT_MS = 15000
@@ -25,6 +26,7 @@ class BrowserController:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._element_index: dict[str, str] = {}
 
     async def __aenter__(self) -> "BrowserController":
         self._pw = await async_playwright().start()
@@ -71,13 +73,33 @@ class BrowserController:
 
     # --- Tools (return dict with result or error for the agent) ---
 
+    def _cache_element_index(self, state_dict: dict[str, Any]) -> None:
+        """Store element-id -> selector map from latest page state."""
+        self._element_index = {}
+        for el in state_dict.get("elements", []) or []:
+            el_id = str(el.get("id", "")).strip()
+            selector = str(el.get("selector", "")).strip()
+            if el_id and selector:
+                self._element_index[el_id] = selector
+
+    def _resolve_selector(self, selector_or_element_id: str) -> str:
+        """Allow selector strings or element IDs (e.g. 'e12' or 'elem:e12')."""
+        raw = (selector_or_element_id or "").strip()
+        if raw.startswith("elem:"):
+            raw = raw.split(":", 1)[1].strip()
+        if raw in self._element_index:
+            return self._element_index[raw]
+        return selector_or_element_id
+
     async def open_url(self, url: str) -> dict[str, Any]:
         """Open a URL and wait for load. Returns page state summary or error."""
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             await asyncio.sleep(DEFAULT_WAIT_AFTER_LOAD_MS / 1000.0)
             state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
+            out = page_state_to_dict(state)
+            self._cache_element_index(out)
+            return {"ok": True, "state": out}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -85,12 +107,15 @@ class BrowserController:
         """Return current page state (url, title, text, buttons, links, inputs)."""
         try:
             state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
+            out = page_state_to_dict(state)
+            self._cache_element_index(out)
+            return {"ok": True, "state": out}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     async def click(self, text_or_selector: str) -> dict[str, Any]:
         """Click element by visible text or selector. Prefer text match for buttons/links."""
+        text_or_selector = self._resolve_selector(text_or_selector)
         try:
             # Try as selector first (e.g. "#submit")
             try:
@@ -100,18 +125,55 @@ class BrowserController:
                 await self.page.get_by_role("button", name=text_or_selector).first.click(timeout=3000)
             await asyncio.sleep(0.5)
             state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
+            out = page_state_to_dict(state)
+            self._cache_element_index(out)
+            return {"ok": True, "state": out}
         except Exception as e1:
             try:
                 await self.page.locator(f"text={text_or_selector}").first.click(timeout=3000)
                 await asyncio.sleep(0.5)
                 state = await get_page_state(self.page)
-                return {"ok": True, "state": page_state_to_dict(state)}
+                out = page_state_to_dict(state)
+                self._cache_element_index(out)
+                return {"ok": True, "state": out}
             except Exception as e2:
                 return {"ok": False, "error": f"click failed: {e1}; fallback: {e2}"}
 
+    async def click_search_button(self) -> dict[str, Any]:
+        """
+        Click a likely search/submit button.
+        Includes YouTube-specific selectors first, then generic search/submit controls.
+        """
+        selectors = [
+            # YouTube
+            "button#search-icon-legacy",
+            "ytd-searchbox button#search-icon-legacy",
+            "yt-icon-button#search-icon-legacy",
+            "button[aria-label*='Search' i]",
+            # Generic search buttons
+            "button[type='submit']",
+            "input[type='submit']",
+            "[role='button'][aria-label*='search' i]",
+            "[title*='search' i]",
+        ]
+        for selector in selectors:
+            result = await self.click(selector)
+            if result.get("ok"):
+                result["clicked"] = selector
+                return result
+
+        labels = ["Search", "Go", "Find", "Submit"]
+        for label in labels:
+            result = await self.click(label)
+            if result.get("ok"):
+                result["clicked"] = label
+                return result
+
+        return {"ok": False, "error": "Could not find a search/submit button to click"}
+
     async def type_text(self, selector: str, value: str) -> dict[str, Any]:
         """Type into an input using keyboard events (triggers autocomplete in SPAs)."""
+        selector = self._resolve_selector(selector)
         try:
             # Try multiple strategies to find and focus the element
             clicked = False
@@ -142,7 +204,9 @@ class BrowserController:
             await self.page.keyboard.type(value, delay=60)
             await asyncio.sleep(1.2)  # Wait for autocomplete to appear
             state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
+            out = page_state_to_dict(state)
+            self._cache_element_index(out)
+            return {"ok": True, "state": out}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -152,7 +216,9 @@ class BrowserController:
             await self.page.keyboard.press(key)
             await asyncio.sleep(0.6)
             state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
+            out = page_state_to_dict(state)
+            self._cache_element_index(out)
+            return {"ok": True, "state": out}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -162,9 +228,47 @@ class BrowserController:
             await self.page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
             await asyncio.sleep(0.5)
             state = await get_page_state(self.page)
-            return {"ok": True, "state": page_state_to_dict(state)}
+            out = page_state_to_dict(state)
+            self._cache_element_index(out)
+            return {"ok": True, "state": out}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    async def submit_search(self, prefer_enter: bool = True) -> dict[str, Any]:
+        """Deterministically submit a filled search input using site adapter logic."""
+        adapter = get_site_adapter(self.page.url)
+        result = await adapter.submit_search(self.page, prefer_enter=prefer_enter)
+        if not result.ok:
+            return {"ok": False, "error": result.error or "submit_search failed"}
+        await asyncio.sleep(1.0)
+        state = await get_page_state(self.page)
+        out = page_state_to_dict(state)
+        self._cache_element_index(out)
+        return {"ok": True, "state": out, "method": result.method}
+
+    async def sort_by_view_count(self) -> dict[str, Any]:
+        """Deterministically sort supported search results by view count (site adapter)."""
+        adapter = get_site_adapter(self.page.url)
+        result = await adapter.sort_by_view_count(self.page)
+        if not result.ok:
+            return {"ok": False, "error": result.error or "sort_by_view_count failed"}
+        await asyncio.sleep(1.0)
+        state = await get_page_state(self.page)
+        out = page_state_to_dict(state)
+        self._cache_element_index(out)
+        return {"ok": True, "state": out, "method": result.method}
+
+    async def open_top_result(self) -> dict[str, Any]:
+        """Open top result for supported sites (site adapter)."""
+        adapter = get_site_adapter(self.page.url)
+        result = await adapter.open_top_result(self.page)
+        if not result.ok:
+            return {"ok": False, "error": result.error or "open_top_result failed"}
+        await asyncio.sleep(1.0)
+        state = await get_page_state(self.page)
+        out = page_state_to_dict(state)
+        self._cache_element_index(out)
+        return {"ok": True, "state": out, "method": result.method}
 
     async def take_screenshot(self, name: str = "screenshot") -> dict[str, Any]:
         """Save a screenshot to logs/ and return path."""
