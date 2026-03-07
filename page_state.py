@@ -118,6 +118,15 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
                 entry["name"] = name
             if el_id:
                 entry["id"] = el_id
+            # For radio/checkbox, include checked state so agent knows current selection.
+            if typ in ("radio", "checkbox"):
+                checked = await el.is_checked()
+                entry["checked"] = checked
+                label_for = await el.get_attribute("id") or ""
+                if label_for:
+                    lbl = await page.query_selector(f"label[for='{label_for}']")
+                    if lbl:
+                        entry["label"] = (await lbl.inner_text()).strip()[:60]
             element_id = next_element_id()
             entry["element_id"] = element_id
             inputs.append(entry)
@@ -134,6 +143,43 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
                         "aria_label": aria_label or None,
                         "name": name or None,
                         "autocomplete": autocomplete or None,
+                        "selector": selector,
+                    }
+                )
+    except Exception:
+        pass
+
+    # Select dropdowns: include current value and available options.
+    try:
+        for el in await page.query_selector_all("select"):
+            aria_label = (await el.get_attribute("aria-label") or "").strip()[:60]
+            name = (await el.get_attribute("name") or "").strip()[:40]
+            el_id = (await el.get_attribute("id") or "").strip()[:40]
+            selected = await el.evaluate("e => e.options[e.selectedIndex]?.text || ''")
+            options = await el.evaluate("e => Array.from(e.options).map(o => o.text).slice(0, 10)")
+            entry = {
+                "type": "select",
+                "value": str(selected)[:40],
+                "options": [str(o)[:40] for o in options],
+            }
+            if aria_label:
+                entry["aria-label"] = aria_label
+            if name:
+                entry["name"] = name
+            if el_id:
+                entry["id"] = el_id
+            element_id = next_element_id()
+            entry["element_id"] = element_id
+            inputs.append(entry)
+            if len(elements) < ELEMENTS_PREVIEW_MAX:
+                selector = f"#{el_id}" if el_id else (f"[name='{name}']" if name else None)
+                elements.append(
+                    {
+                        "id": element_id,
+                        "kind": "input",
+                        "type": "select",
+                        "aria_label": aria_label or None,
+                        "name": name or None,
                         "selector": selector,
                     }
                 )

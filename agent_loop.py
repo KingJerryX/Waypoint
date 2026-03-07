@@ -172,7 +172,7 @@ GEMINI_TOOL_DECLARATIONS = [
     },
     {
         "name": TOOL_TYPE,
-        "description": "Type text into an input field. Use the exact placeholder text or label visible on the page (e.g. 'Where to?', 'Search', 'Destination'). IMPORTANT: After type(...) for a search query, the VERY NEXT action must be search submission via click(Search/Submit/magnifier) or press_key('Enter'). Never type the same query twice in a row.",
+        "description": "Type text into an input field. Use the exact placeholder text or label visible on the page (e.g. 'Where to?', 'Search', 'Destination'). Call get_page_state first to see available inputs if unsure. IMPORTANT: After type(...) for a search query, your very next action must be submit_search(prefer_enter=true) (or false as fallback). Never type the same query twice in a row.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -277,16 +277,18 @@ def _build_tools_for_gemini(tool_names: list[str]):
     return [{"function_declarations": declarations}]
 
 
-def _resolve_model_name() -> str:
+_CACHED_MODEL_CANDIDATES: list[str] | None = None
+
+
+def _resolve_model_candidates() -> list[str]:
     """
-    Pick a model that is actually available for generateContent on this key.
-    Order:
-      1) ORBIT_GEMINI_MODEL (if present and available, otherwise still used as fallback)
-      2) Preferred flash models that exist in list_models()
-      3) Any available flash model
-      4) First available generateContent model
-      5) Final fallback to env/default
+    Return an ordered candidate list to try for generateContent.
+    Calls list_models() ONCE and caches the result for the process lifetime.
     """
+    global _CACHED_MODEL_CANDIDATES
+    if _CACHED_MODEL_CANDIDATES is not None:
+        return _CACHED_MODEL_CANDIDATES
+
     env_model = (os.environ.get("ORBIT_GEMINI_MODEL") or "").strip()
     preferred = [
         m
@@ -300,6 +302,8 @@ def _resolve_model_name() -> str:
         ]
         if m
     ]
+
+    # Single network call — cached after first run
     try:
         available_raw = list(genai.list_models())
     except Exception:
@@ -316,25 +320,23 @@ def _resolve_model_name() -> str:
         if name:
             available.append(name)
 
+    # Pick best model, then build fallback list
+    first = None
     if available:
         available_set = set(available)
         for candidate in preferred:
             if candidate in available_set:
-                return candidate
-        for candidate in available:
-            if "flash" in candidate.lower():
-                return candidate
-        return available[0]
+                first = candidate
+                break
+        if not first:
+            for candidate in available:
+                if "flash" in candidate.lower():
+                    first = candidate
+                    break
+        if not first:
+            first = available[0]
+    first = first or env_model or "gemini-2.5-flash"
 
-    return env_model or "gemini-2.5-flash"
-
-
-def _resolve_model_candidates() -> list[str]:
-    """
-    Return an ordered candidate list to try for generateContent.
-    First candidate is preferred; next are fallbacks.
-    """
-    first = _resolve_model_name()
     defaults = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -346,6 +348,8 @@ def _resolve_model_candidates() -> list[str]:
     for m in [first] + defaults:
         if m and m not in out:
             out.append(m)
+
+    _CACHED_MODEL_CANDIDATES = out
     return out
 
 
@@ -363,7 +367,11 @@ def _call_gemini_sync(
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         return None, None, {"error": "GOOGLE_API_KEY not set"}
-    genai.configure(api_key=api_key)
+
+    # configure once per process (idempotent but avoid repeated calls)
+    if not getattr(_call_gemini_sync, "_configured", False):
+        genai.configure(api_key=api_key)
+        _call_gemini_sync._configured = True
 
     tools = _build_tools_for_gemini(tool_names)
     candidates = _resolve_model_candidates()
@@ -778,6 +786,8 @@ async def run_agent(
             if on_pause:
                 # Emit the pause event and block until the human clicks Resume
                 await on_pause(reason)
+                # Wait for any post-CAPTCHA/login redirect to fully settle before reading state
+                await browser.wait_for_settled()
                 # Refresh page state — the human may have logged in or solved a CAPTCHA
                 try:
                     refresh = await browser.get_page_state()
@@ -785,11 +795,13 @@ async def run_agent(
                         current_state = refresh.get("state")
                 except Exception:
                     pass
-                # Tell the agent the human is done so it doesn't call request_human_help again
+                # Tell the agent the human is done and give it clear direction to restart the task
                 resume_note = (
-                    "The human has just completed the required action (login / CAPTCHA / verification). "
-                    "Authentication is now done. Do NOT call request_human_help again. "
-                    "Continue the original task using the current page shown below."
+                    "The human just completed the required action (CAPTCHA / login / verification) and clicked Resume. "
+                    "The page has reloaded — check the current page state below. "
+                    "Do NOT call request_human_help again. "
+                    "Re-read the current page with get_page_state(), then continue the original task from where it left off. "
+                    "If the page is a home page or search form, start the task over from the beginning (open the right URL or fill in the search)."
                 )
                 # Take a fresh screenshot so the UI updates
                 if on_step:
