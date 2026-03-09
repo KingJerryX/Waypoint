@@ -91,7 +91,14 @@ class BrowserController:
             wait_until = "commit" if is_blank else "domcontentloaded"
             await self.page.goto(url, wait_until=wait_until, timeout=NAV_TIMEOUT_MS)
             if not is_blank:
+                # Brief networkidle wait so React/Vue apps finish their initial render.
+                # 2 s cap — some sites poll forever so we never wait more than this.
+                try:
+                    await self.page.wait_for_load_state("networkidle", timeout=2000)
+                except Exception:
+                    pass
                 await asyncio.sleep(DEFAULT_WAIT_AFTER_LOAD_MS / 1000.0)
+                await self._dismiss_overlays()
             state = await get_page_state(self.page)
             return {"ok": True, "state": page_state_to_dict(state)}
         except Exception as e:
@@ -134,7 +141,7 @@ class BrowserController:
         for make_locator, timeout in strategies:
             try:
                 await make_locator().click(timeout=timeout)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1.0)  # long enough for dropdown animations to render (was 0.3s)
                 state = await get_page_state(self.page)
                 return {"ok": True, "state": page_state_to_dict(state)}
             except Exception as e:
@@ -172,7 +179,7 @@ class BrowserController:
 
             # Type character-by-character to fire events (triggers autocomplete etc.)
             await self.page.keyboard.type(value, delay=40)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.2)  # wait for autocomplete/network fetch to return (was 0.3s)
 
             # Auto-submit search inputs so the agent never has to guess
             _is_search = any(kw in selector.lower() for kw in ("search", "query", "q", "find", "keyword"))
@@ -217,13 +224,57 @@ class BrowserController:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    async def _dismiss_overlays(self) -> None:
+        """Dismiss cookie banners, consent dialogs, and common modal overlays via JS click."""
+        try:
+            dismissed = await self.page.evaluate("""() => {
+                const labels = [
+                    'Accept all cookies','Accept All Cookies','Accept all','Accept All',
+                    'Accept cookies','Accept Cookies','Allow all cookies','Allow all',
+                    'Agree','I agree','I Accept','Agree & Proceed',
+                    'Got it','OK','Ok','Okay','Continue','Done',
+                    'Dismiss','Close','No thanks','Reject all','Decline all',
+                ];
+                const selectors = [
+                    'button','[role="button"]',
+                    '[class*="cookie"] button','[class*="consent"] button',
+                    '[class*="banner"] button','[class*="modal"] button',
+                    '[class*="overlay"] button','[class*="dialog"] button',
+                    '[class*="gdpr"] button','[class*="notice"] button',
+                ];
+                for (const label of labels) {
+                    for (const sel of selectors) {
+                        const els = [...document.querySelectorAll(sel)].filter(
+                            el => el.offsetParent !== null &&
+                                  el.innerText.trim().toLowerCase() === label.toLowerCase()
+                        );
+                        if (els.length > 0) { els[0].click(); return true; }
+                    }
+                }
+                // Fallback: any visible [aria-label="Close"] or button.close
+                const close = document.querySelector(
+                    '[aria-label="Close"],[aria-label="close"],[aria-label="Dismiss"],button.close,button[title="Close"]'
+                );
+                if (close && close.offsetParent !== null) { close.click(); return true; }
+                return false;
+            }""")
+            if dismissed:
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
     async def wait_for_settled(self, timeout_ms: int = 5000) -> None:
         """Wait for the page to finish navigating/loading after human interaction."""
         try:
             await self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
         except Exception:
             pass
-        await asyncio.sleep(1.5)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=2000)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+        await self._dismiss_overlays()
 
     async def screenshot_b64(self) -> str:
         """Take a screenshot and return as base64-encoded PNG string."""

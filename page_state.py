@@ -14,6 +14,7 @@ class PageState:
     buttons: list[str]
     links: list[str]
     inputs: list[dict[str, Any]]
+    dropdown_options: list[str]
 
 
 async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageState:
@@ -112,6 +113,27 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
     except Exception:
         pass
 
+    # Dropdown / autocomplete options: visible [role="option"] and [role="menuitem"] elements.
+    # These are only present when a dropdown or autocomplete list is open — critical for
+    # the agent to see what's available after clicking a combobox or typing into a location field.
+    dropdown_options: list[str] = []
+    try:
+        for el in await page.query_selector_all(
+            "[role='option'], [role='menuitem'], [role='listbox'] li, [role='menu'] li"
+        ):
+            try:
+                if not await el.is_visible():
+                    continue
+                t = (await el.inner_text()).strip()[:80]
+                if t and t not in dropdown_options:
+                    dropdown_options.append(t)
+                if len(dropdown_options) >= 15:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return PageState(
         url=url,
         title=title,
@@ -119,12 +141,13 @@ async def get_page_state(page: Any, text_max: int = TEXT_PREVIEW_MAX) -> PageSta
         buttons=buttons,
         links=links,
         inputs=inputs,
+        dropdown_options=dropdown_options,
     )
 
 
 def page_state_to_dict(state: PageState) -> dict[str, Any]:
     """For JSON logging and LLM context."""
-    return {
+    d: dict[str, Any] = {
         "url": state.url,
         "title": state.title,
         "text": state.text,
@@ -132,3 +155,6 @@ def page_state_to_dict(state: PageState) -> dict[str, Any]:
         "links": state.links[:20],
         "inputs": state.inputs,
     }
+    if state.dropdown_options:
+        d["dropdown_options"] = state.dropdown_options
+    return d

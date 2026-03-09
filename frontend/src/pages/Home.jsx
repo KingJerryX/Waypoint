@@ -34,16 +34,15 @@ function StatusPill({ status }) {
   );
 }
 
-function ScreenshotViewer({ screenshots, status }) {
-  const latest = screenshots?.length ? screenshots[screenshots.length - 1] : null;
+function ScreenshotViewer({ screenshot, stepCount, status }) {
   return (
     <div className="relative w-full bg-black rounded-xl overflow-hidden border border-cyan-500/10" style={{ aspectRatio: "16/10" }}>
-      {latest ? (
+      {screenshot ? (
         <>
-          <img src={latest} alt="Browser screenshot" className="w-full h-full object-contain" />
-          {screenshots.length > 1 && (
+          <img src={screenshot} alt="Browser screenshot" className="w-full h-full object-contain" />
+          {stepCount > 1 && (
             <span className="absolute bottom-2 right-3 text-xs text-slate-400 bg-black/60 px-2 py-0.5 rounded-full">
-              frame {screenshots.length}
+              step {stepCount}
             </span>
           )}
         </>
@@ -60,6 +59,37 @@ function ScreenshotViewer({ screenshots, status }) {
   );
 }
 
+function ActivityLog({ log, scrollRef }) {
+  if (!log.length) return null;
+  return (
+    <div className="w-full rounded-xl overflow-hidden" style={{ background: "#0d1622", border: "1px solid rgba(0,212,255,0.1)" }}>
+      <div className="px-4 py-2 flex items-center gap-2 border-b" style={{ borderColor: "rgba(0,212,255,0.08)" }}>
+        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+        <span className="text-xs font-bold uppercase tracking-widest" style={{ color: "#475569" }}>Activity</span>
+      </div>
+      <div
+        ref={scrollRef}
+        className="px-4 py-2 space-y-1 overflow-y-auto"
+        style={{ maxHeight: 140 }}
+      >
+        {log.map((item, i) => {
+          const isLatest = i === log.length - 1;
+          return (
+            <div key={i} className="flex items-center gap-3 text-xs">
+              <span className="font-mono shrink-0" style={{ color: "#334155", minWidth: 28 }}>
+                #{item.step}
+              </span>
+              <span style={{ color: isLatest ? "#00d4ff" : "#475569" }}>
+                {item.message}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [url, setUrl] = useState("");
@@ -68,10 +98,13 @@ export default function Home() {
   const estimateTimer = useRef(null);
 
   const [status, setStatus] = useState(null);
-  const [screenshots, setScreenshots] = useState([]);
+  const [latestScreenshot, setLatestScreenshot] = useState(null);
+  const [stepCount, setStepCount] = useState(0);
+  const [activityLog, setActivityLog] = useState([]);
   const [output, setOutput] = useState(null);
   const [error, setError] = useState(null);
   const [running, setRunning] = useState(false);
+  const activityEndRef = useRef(null);
 
   const [shareTitle, setShareTitle] = useState("");
   const [shareLink, setShareLink] = useState("");
@@ -83,6 +116,13 @@ export default function Home() {
   const [saved, setSavedState] = useState(getSaved);
   const [showSaved, setShowSaved] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Auto-scroll activity log to bottom on new entries
+  useEffect(() => {
+    if (activityEndRef.current) {
+      activityEndRef.current.scrollTop = activityEndRef.current.scrollHeight;
+    }
+  }, [activityLog]);
 
   useEffect(() => {
     if (estimateTimer.current) clearTimeout(estimateTimer.current);
@@ -107,7 +147,9 @@ export default function Home() {
     if (!prompt.trim() || running) return;
     setRunning(true);
     setStatus("running");
-    setScreenshots([]);
+    setLatestScreenshot(null);
+    setStepCount(0);
+    setActivityLog([]);
     setOutput(null);
     setError(null);
     setShareLink("");
@@ -139,7 +181,11 @@ export default function Home() {
             if (event.type === "status") setStatus(event.status);
             else if (event.type === "screenshot") {
               setStatus("running");
-              setScreenshots(prev => [...prev, `data:image/png;base64,${event.data}`]);
+              // Replace instead of append — only the latest frame matters, prevents memory growth
+              setLatestScreenshot(`data:image/png;base64,${event.data}`);
+              setStepCount(n => n + 1);
+            } else if (event.type === "activity") {
+              setActivityLog(prev => [...prev, { step: event.step, message: event.message }]);
             } else if (event.type === "human_required") {
               setStatus("paused");
               setPaused({ session_id: event.session_id, reason: event.reason });
@@ -399,7 +445,8 @@ export default function Home() {
           {/* Live browser */}
           {(status || running) && (
             <div className="w-full mx-auto space-y-4 text-left" style={{ maxWidth: 672 }}>
-              <ScreenshotViewer screenshots={screenshots} status={status} />
+              <ScreenshotViewer screenshot={latestScreenshot} stepCount={stepCount} status={status} />
+              <ActivityLog log={activityLog} scrollRef={activityEndRef} />
 
               {output && (
                 <div className="rounded-xl p-5 text-sm leading-relaxed whitespace-pre-wrap" style={{ background: "#16222c", border: "1px solid rgba(52,211,153,0.2)" }}>

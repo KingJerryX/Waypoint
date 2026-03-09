@@ -64,7 +64,7 @@ GEMINI_TOOL_DECLARATIONS = [
     },
     {
         "name": TOOL_GET_PAGE_STATE,
-        "description": "Get current page state: url, title, visible text, buttons, links, inputs. Call this to see what is on the page.",
+        "description": "Get current page state: url, title, visible text, buttons, links, inputs, and dropdown_options (the list of visible options when a dropdown or autocomplete is open). Call this after clicking a dropdown trigger or typing into an autocomplete field to see what options are available.",
         "parameters": {"type": "object", "properties": {}},
     },
     {
@@ -138,6 +138,36 @@ GEMINI_TOOL_DECLARATIONS = [
         },
     },
 ]
+
+
+def _describe_action(tool_name: str, args: dict) -> str:
+    """Return a short human-readable description of an agent action for the activity log."""
+    if tool_name == TOOL_OPEN_URL:
+        url = args.get("url", "")
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc or url
+        except Exception:
+            host = url[:50]
+        return f"Opening {host}"
+    if tool_name == TOOL_GET_PAGE_STATE:
+        return "Reading page content"
+    if tool_name == TOOL_CLICK:
+        t = args.get("text_or_selector", "")
+        return f'Clicking "{t}"'
+    if tool_name == TOOL_TYPE:
+        val = args.get("value", "")
+        sel = args.get("selector", "")
+        return f'Typing "{val}" into {sel}'
+    if tool_name == TOOL_PRESS_KEY:
+        return f"Pressing {args.get('key', '?')}"
+    if tool_name == TOOL_SCROLL_DOWN:
+        return "Scrolling down to load more"
+    if tool_name == TOOL_REQUEST_HUMAN:
+        return f"Pausing — {args.get('reason', 'human action required')}"
+    if tool_name == TOOL_DONE:
+        return "Preparing final answer"
+    return f"Running {tool_name}"
 
 
 def _build_tools_for_gemini(tool_names: list[str]):
@@ -277,18 +307,21 @@ def _call_gemini_sync(
             tools=tools,
             system_instruction=system_prompt,
         )
-        # Single message for MVP: full context in user_message; no multi-turn to avoid content format issues
         try:
-            # mode=ANY forces Gemini to always call one of the provided tools
+            # Multi-turn chat: Gemini sees its own past decisions + tool results
             try:
-                response = model.generate_content(
+                chat = model.start_chat(history=history)
+            except Exception:
+                chat = model.start_chat(history=[])  # bad history format — degrade gracefully
+            try:
+                response = chat.send_message(
                     user_message,
                     tool_config={"function_calling_config": {"mode": "ANY"}},
                 )
             except Exception:
-                response = model.generate_content(user_message)
+                response = chat.send_message(user_message)
             # #region agent log
-            _debug_log("gemini generate_content success", {"model_name": model_name}, run_id=run_id, hypothesis_id="H8")
+            _debug_log("gemini start_chat success", {"model_name": model_name, "history_len": len(history)}, run_id=run_id, hypothesis_id="H8")
             # #endregion
             break
         except Exception as e:
@@ -350,6 +383,7 @@ async def run_agent(
     log_dir: Optional[Path] = None,
     on_step: Optional[Callable] = None,
     on_pause: Optional[Callable] = None,
+    on_activity: Optional[Callable] = None,
     session_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """
@@ -363,6 +397,11 @@ async def run_agent(
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     steps_log: list[dict] = []
+    # Chat history for multi-turn memory. Must start with a "user" role entry so subsequent
+    # (model → user) action pairs always have a valid predecessor.
+    conversation_history: list[dict] = [
+        {"role": "user", "parts": [{"text": f"Task: {task}"}]}
+    ]
     current_state: Optional[dict] = None
     last_error: Optional[str] = None
     final_answer: Optional[str] = None
@@ -402,12 +441,40 @@ async def run_agent(
         last_error = None
         resume_note = None  # only inject once, immediately after a pause
 
+        # Repetition guard:
+        #   (1) Warn on actions that have FAILED 2+ times — model must try a different approach
+        #   (2) Warn on ANY action repeated 3+ times total — catches infinite loops where the
+        #       same action "succeeds" (e.g. clicking "Round trip" reopens the dropdown) but
+        #       the agent isn't making progress
+        _fail_counts: dict[str, int] = {}
+        _all_counts: dict[str, int] = {}
+        for _s in steps_log:
+            if _s.get("tool") in ("gemini", TOOL_DONE, TOOL_REQUEST_HUMAN):
+                continue
+            _key = f"{_s['tool']}({json.dumps(_s.get('args', {}), sort_keys=True)})"
+            _all_counts[_key] = _all_counts.get(_key, 0) + 1
+            if not _s.get("ok"):
+                _fail_counts[_key] = _fail_counts.get(_key, 0) + 1
+        _repeated_fail = [k for k, n in _fail_counts.items() if n >= 2]
+        _repeated_loop = [k for k, n in _all_counts.items() if n >= 3]
+        if _repeated_fail:
+            user_message += (
+                f"\n\n⚠️ IMPORTANT: These exact actions have failed 2+ times — "
+                f"do NOT retry them, try a completely different approach: {_repeated_fail}"
+            )
+        if _repeated_loop:
+            user_message += (
+                f"\n\n⚠️ LOOP DETECTED: These actions have been repeated 3+ times — "
+                f"you are stuck in a loop and not making progress. "
+                f"Stop repeating and try a completely different approach: {_repeated_loop}"
+            )
+
         # Call Gemini in a thread so we don't block event loop
         fn_name, fn_args, err = await asyncio.to_thread(
             _call_gemini_sync,
             system_prompt,
             user_message,
-            [],  # history not used in single-turn MVP
+            conversation_history,
             constraints.allowed_tools,
             session_id,
         )
@@ -458,6 +525,13 @@ async def run_agent(
                 continue
             steps_log.append({"tool": fn_name, "args": fn_args, "approved": True})
 
+        # Broadcast what the agent is about to do (visible in the activity log)
+        if on_activity:
+            try:
+                await on_activity(step_count, _describe_action(fn_name, fn_args or {}))
+            except Exception:
+                pass
+
         # Execute tool
         if fn_name == TOOL_REQUEST_HUMAN:
             reason = fn_args.get("reason", "Human assistance required")
@@ -489,6 +563,11 @@ async def run_agent(
                         await on_step(step_count, TOOL_REQUEST_HUMAN, b64)
                     except Exception:
                         pass
+            # Record the pause + resume in history so the model knows a human intervened
+            conversation_history.extend([
+                {"role": "model", "parts": [{"function_call": {"name": TOOL_REQUEST_HUMAN, "args": fn_args or {}}}]},
+                {"role": "user",  "parts": [{"function_response": {"name": TOOL_REQUEST_HUMAN, "response": {"result": "human_completed_action"}}}]},
+            ])
             step_count += 1
             continue
 
@@ -500,7 +579,12 @@ async def run_agent(
         result = {}
         if fn_name == TOOL_OPEN_URL:
             u = fn_args.get("url", "")
-            if not constraints.is_domain_allowed(u):
+            # Reject non-http(s) schemes — prevents file://, javascript:, data: injection
+            _scheme = u.split("://")[0].lower() if "://" in u else ""
+            if _scheme and _scheme not in ("http", "https"):
+                last_error = f"URL scheme '{_scheme}' is not allowed. Only http:// and https:// are permitted."
+                result = {"ok": False, "error": last_error}
+            elif not constraints.is_domain_allowed(u):
                 last_error = "That URL's domain is not allowed."
                 result = {"ok": False, "error": last_error}
             else:
@@ -556,6 +640,18 @@ async def run_agent(
                 tools_failed += 1
         else:
             last_error = f"Unknown tool: {fn_name}"
+
+        # Update conversation history with what the model decided and what actually happened.
+        # Compact format: only function_call + function_response (no page state blobs) to
+        # keep token cost low while giving Gemini full action memory.
+        _hist_result = {"result": "success"} if result.get("ok") else {"error": last_error or "failed"}
+        conversation_history.extend([
+            {"role": "model", "parts": [{"function_call": {"name": fn_name, "args": fn_args or {}}}]},
+            {"role": "user",  "parts": [{"function_response": {"name": fn_name, "response": _hist_result}}]},
+        ])
+        # Cap: keep the synthetic opener (index 0) + the last 10 action pairs (20 entries)
+        if len(conversation_history) > 21:
+            conversation_history = conversation_history[:1] + conversation_history[-20:]
 
         steps_log.append({"tool": fn_name, "args": fn_args, "ok": result.get("ok", False), "error": last_error})
         if on_step:

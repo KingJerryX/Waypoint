@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,6 +38,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _require_http_url(url: str | None) -> str | None:
+    """Reject file://, javascript:, data: and any other non-http(s) scheme."""
+    if not url or url.strip() in ("", "about:blank"):
+        return url
+    from urllib.parse import urlparse
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid URL scheme '{parsed.scheme}'. Only http:// and https:// are allowed.",
+        )
+    return url.strip()
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
@@ -194,10 +209,13 @@ Reply with ONLY a single integer. No explanation."""
 # ── Local Playwright streaming ───────────────────────────────────────────────
 
 @app.post("/api/run/local")
-async def run_local_stream(req: RunRequest):
+async def run_local_stream(req: RunRequest, request: Request):
     """Run automation locally with Playwright + Gemini. Streams screenshots via SSE."""
     if not os.environ.get("GOOGLE_API_KEY"):
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not set — add it to .env")
+
+    # Validate URL scheme before launching any browser process
+    validated_url = _require_http_url(req.url)
 
     from browser_tools import BrowserController
     from agent_loop import run_agent as _run_agent
@@ -209,6 +227,7 @@ async def run_local_stream(req: RunRequest):
     import uuid as _uuid
     session_id = str(_uuid.uuid4())[:8]
     pause_event = threading.Event()
+    stop_event = threading.Event()   # set when the SSE client disconnects
     PAUSE_EVENTS[session_id] = pause_event
 
     def run_in_thread():
@@ -224,16 +243,24 @@ async def run_local_stream(req: RunRequest):
         asyncio.set_event_loop(loop)
 
         def put(event):
-            asyncio.run_coroutine_threadsafe(queue.put(event), main_loop).result(timeout=10)
+            try:
+                asyncio.run_coroutine_threadsafe(queue.put(event), main_loop).result(timeout=10)
+            except Exception:
+                pass  # SSE stream already closed — discard silently
 
         async def on_step(step: int, tool: str, b64: str):
             put({"type": "screenshot", "step": step, "tool": tool, "data": b64})
 
+        async def on_activity(step: int, message: str):
+            put({"type": "activity", "step": step, "message": message})
+
         async def on_pause(reason: str):
-            """Emit human_required event, then block until the user clicks Resume."""
+            """Emit human_required event, then block until the user clicks Resume or disconnects."""
             put({"type": "human_required", "session_id": session_id, "reason": reason})
-            # Wait for the resume endpoint to set the event (5-minute timeout)
+            # Wait for resume OR client disconnect (whichever comes first)
             await asyncio.get_event_loop().run_in_executor(None, pause_event.wait, 300)
+            if stop_event.is_set():
+                raise RuntimeError("Client disconnected — aborting session")
             pause_event.clear()
             put({"type": "status", "status": "running"})
 
@@ -246,11 +273,12 @@ async def run_local_stream(req: RunRequest):
                     result = await _run_agent(
                         browser,
                         task=req.prompt,
-                        url=req.url or "about:blank",
+                        url=validated_url or "about:blank",
                         max_steps=steps,
                         constraints=constraints,
                         on_step=on_step,
                         on_pause=on_pause,
+                        on_activity=on_activity,
                         session_id=session_id,
                     )
                     put({"type": "done", "ok": result.get("ok"),
@@ -258,7 +286,6 @@ async def run_local_stream(req: RunRequest):
             except Exception as e:
                 put({"type": "error", "error": str(e)})
             finally:
-                PAUSE_EVENTS.pop(session_id, None)
                 put(None)
 
         try:
@@ -267,17 +294,26 @@ async def run_local_stream(req: RunRequest):
             loop.close()
 
     async def event_stream():
-        yield f"data: {json.dumps({'type': 'status', 'status': 'running'})}\n\n"
-        asyncio.create_task(asyncio.to_thread(run_in_thread))
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=120)
-            except asyncio.TimeoutError:
-                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
-                continue
-            if event is None:
-                break
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            yield f"data: {json.dumps({'type': 'status', 'status': 'running'})}\n\n"
+            asyncio.create_task(asyncio.to_thread(run_in_thread))
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    # Check for client disconnect every 30 s instead of blocking for 2 min
+                    if await request.is_disconnected():
+                        break
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+                    continue
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            # Client closed tab or connection dropped — unblock any waiting pause and clean up
+            stop_event.set()
+            pause_event.set()   # wake on_pause so the agent thread can exit
+            PAUSE_EVENTS.pop(session_id, None)
 
     return StreamingResponse(
         event_stream(),
