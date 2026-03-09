@@ -1,4 +1,4 @@
-# Orbit — Browser agent MVP
+# Waypoint — Browser agent MVP
 
 A lightweight browser agent that opens a URL and completes a task (summarize, extract, or light interaction) using **Playwright** and **Google Gemini**.
 
@@ -15,7 +15,7 @@ A lightweight browser agent that opens a URL and completes a task (summarize, ex
 ### 1. Python env and deps
 
 ```bash
-cd orbit
+cd Waypoint
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -35,7 +35,7 @@ Create an API key (e.g. [Google AI Studio](https://aistudio.google.com/)), then:
 export GOOGLE_API_KEY="your-key"
 ```
 
-Or add to a `.env` in `orbit/` and load with `python-dotenv` (optional):
+Or add to a `.env` in `Waypoint/` and load with `python-dotenv` (optional):
 
 ```
 GOOGLE_API_KEY=your-key
@@ -45,8 +45,8 @@ GOOGLE_API_KEY=your-key
 
 ### Generate a link and run the agent in the browser
 
-1. **One-time setup:** In `orbit/`, set `GOOGLE_API_KEY` (env or `.env`), create venv, `pip install -r requirements.txt`, `playwright install chromium`, and build the frontend: `cd frontend && npm install && npm run build && cd ..`.
-2. **Start the server:** From `orbit/`, run `uvicorn main:app --reload`.
+1. **One-time setup:** In `Waypoint/`, set `GOOGLE_API_KEY` (env or `.env`), create venv, `pip install -r requirements.txt`, `playwright install chromium`, and build the frontend: `cd frontend && npm install && npm run build && cd ..`.
+2. **Start the server:** From `Waypoint/`, run `uvicorn main:app --reload`.
 3. **Create a manual:** Open http://localhost:8000, fill **Title**, **URL to open**, and **Task for the agent**. Optionally check **Auto-run when link is opened**. Click **Create & get link**.
 4. **Share the link:** Copy the link (e.g. `http://localhost:8000/go/abc12345` or with `?auto=1` for auto-run). When someone opens it, they see the task and can click **Run agent** (or the agent runs automatically if you used the auto-run option).
 5. **Run:** The server runs the agent (Playwright + Gemini) and returns the answer on the page.
@@ -115,6 +115,16 @@ python eval.py --dataset eval_dataset.json --output eval_report.json
 
 This writes `eval_report.json` and `eval_report.md` with per-run metrics and a small table.
 
+### Crawl reliability benchmark
+
+Run the benchmark suite to track crawl workflow quality (loop breaks, forced refreshes, auto-submit success):
+
+```bash
+python benchmark_agent.py --dataset eval_dataset.json --output benchmark_report.json
+```
+
+This writes `benchmark_report.json` and `benchmark_report.md`.
+
 ## What you need to do (can’t be fully automated)
 
 | Step | What to do |
@@ -127,7 +137,7 @@ This writes `eval_report.json` and `eval_report.md` with per-run metrics and a s
 ## Project layout
 
 ```
-orbit/
+Waypoint/
 ├── main.py           # FastAPI app + CLI
 ├── agent_loop.py     # Gemini + tools + approval + metrics
 ├── browser_tools.py  # Playwright wrappers
@@ -136,7 +146,9 @@ orbit/
 ├── config.py         # UserConstraints
 ├── manuals.py        # Server-side manual storage (shareable links)
 ├── eval.py           # Batch eval script
+├── benchmark_agent.py # Crawl reliability benchmark script
 ├── eval_dataset.json
+├── site_adapters.py  # Deterministic site-specific helper flows
 ├── requirements.txt
 ├── frontend/        # React (Vite) app: create manual, My Agents, run-by-link page
 ├── static/          # Legacy static HTML (used if frontend/dist not built)
