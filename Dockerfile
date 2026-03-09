@@ -3,10 +3,12 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PLAYWRIGHT_HEADLESS=true
 ENV PORT=10000
 
 WORKDIR /app
 
+# System packages for Node + Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gnupg \
     libnss3 \
@@ -40,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install the actual Playwright browser
 RUN python -m playwright install chromium
 
 COPY . .

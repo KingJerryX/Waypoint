@@ -54,6 +54,14 @@ def _require_http_url(url: str | None) -> str | None:
         )
     return url.strip()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a bool env var like true/false/1/0/yes/no/on/off."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
 # ── Models ──────────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
@@ -269,7 +277,9 @@ async def run_local_stream(req: RunRequest, request: Request):
                 from config import UserConstraints
                 steps = req.max_steps or 15
                 constraints = UserConstraints(max_steps=steps)
-                async with BrowserController(headless=False) as browser:
+                # Render/containers typically have no X server; run headless unless explicitly disabled.
+                headless = _env_bool("PLAYWRIGHT_HEADLESS", True)
+                async with BrowserController(headless=headless) as browser:
                     result = await _run_agent(
                         browser,
                         task=req.prompt,
