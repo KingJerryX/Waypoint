@@ -6,5 +6,23 @@
     "build": "npm run build --prefix frontend",
     "install:frontend": "npm install --prefix frontend",
     "postinstall": "npm install --prefix frontend"
+  },
+  "version": "1.0.0",
+  "description": "A lightweight browser agent that opens a URL and completes a task (summarize, extract, or light interaction) using **Playwright** and **Google Gemini**.",
+  "main": "create_pitch_deck.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KingJerryX/Waypoint.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/KingJerryX/Waypoint/issues"
+  },
+  "homepage": "https://github.com/KingJerryX/Waypoint#readme",
+  "dependencies": {
+    "pptxgenjs": "^4.0.1"
   }
 }

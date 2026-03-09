@@ -269,7 +269,7 @@ async def run_local_stream(req: RunRequest, request: Request):
                 from config import UserConstraints
                 steps = req.max_steps or 15
                 constraints = UserConstraints(max_steps=steps)
-                async with BrowserController(headless=False) as browser:
+                async with BrowserController(headless=os.environ.get("HEADLESS", "true").lower() != "false") as browser:
                     result = await _run_agent(
                         browser,
                         task=req.prompt,
